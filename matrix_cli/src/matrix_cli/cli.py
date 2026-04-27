@@ -9,9 +9,19 @@ Usage:
 
 import argparse
 import sys
+from importlib import metadata
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None  # type: ignore[assignment]
 
 from matrix_cli.log import logger
-from matrix_cli.matrix_cli_rs import get_version_string, get_verbose_version_string
+
+
+_PACKAGE_NAME = "matrix-cli"
+_FALLBACK_VERSION = "0.0.1"
 
 
 def print_help() -> None:
@@ -25,6 +35,47 @@ Usage:
     matrix --help OR matrix-cli --help                        # Show help
     matrix --version OR matrix-cli --version                  # Show version
 """)
+
+
+def _get_project_version() -> str:
+    """Return the Python package version without requiring the Rust extension."""
+    try:
+        return metadata.version(_PACKAGE_NAME)
+    except metadata.PackageNotFoundError:
+        pass
+
+    if tomllib is None:
+        return _FALLBACK_VERSION
+
+    try:
+        pyproject_path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        with pyproject_path.open("rb") as pyproject_file:
+            pyproject = tomllib.load(pyproject_file)
+        version = pyproject.get("project", {}).get("version")
+    except (OSError, tomllib.TOMLDecodeError):
+        return _FALLBACK_VERSION
+
+    return version if isinstance(version, str) else _FALLBACK_VERSION
+
+
+def _get_version_string() -> str:
+    """Return the CLI version, falling back when the Rust extension is unavailable."""
+    try:
+        from matrix_cli.matrix_cli_rs import get_version_string
+    except ImportError:
+        return f"matrix-cli {_get_project_version()}"
+
+    return get_version_string()
+
+
+def _get_verbose_version_string() -> str:
+    """Return verbose CLI version details without requiring the Rust extension."""
+    try:
+        from matrix_cli.matrix_cli_rs import get_verbose_version_string
+    except ImportError:
+        return f"matrix-cli {_get_project_version()}\n\nRust extension: not installed"
+
+    return get_verbose_version_string()
 
 
 def _parse_router_args_with_command(argv: list[str]) -> tuple[str | None, list[str]]:
@@ -62,7 +113,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # Handle version flags
     if argv and argv[0] in ["--version", "-V", "--version-verbose"]:
-        version_func = get_verbose_version_string if argv[0] == "--version-verbose" else get_version_string
+        version_func = _get_verbose_version_string if argv[0] == "--version-verbose" else _get_version_string
         logger.info(version_func())
         sys.exit(0)
 
