@@ -1,0 +1,48 @@
+[project]
+name = "matrix-cli"
+version = "0.0.1"
+description = "High-performance Rust-based inference gateway for large-scale LLM deployments"
+authors = [
+    {name = "momo", email = "momo@test.com"}
+]
+requires-python = ">=3.9"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+classifiers = [
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+
+dependencies = [
+    "setproctitle",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy",
+    "requests>=2.25.0",
+    "ruff",
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+matrix-cli = "matrix_cli.cli:main"
+matrix = "matrix_cli.cli:main"
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "src"
+module-name = "matrix_cli.matrix_cli_rs"
+# Exclude README.md to use root README only
+exclude = ["README.md"]
+

@@ -1,0 +1,26 @@
+[package]
+name = "matrix_cli"
+version = "0.0.1"
+edition = "2024"
+
+[lib]
+name = "matrix_cli_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27.1", features = ["extension-module", "abi3-py38"] }
+rand = "0.9.2"
+serde_yaml = { workspace = true }
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "full"] }
+once_cell = "1.21.4"
+smg = { workspace = true }
+smg-auth = { workspace = true }
+smg-mesh = { workspace = true }
+tool-parser = { workspace = true }
+reasoning-parser = { workspace = true }
+
+[dependencies.matrix_router]
+path = "../matrix_router"
+
+[lints]
+workspace = true

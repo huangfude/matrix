@@ -1,0 +1,11 @@
+# Sample configuration file for SGLang
+model_path: "Qwen/Qwen3-72B-Instruct"
+host: "0.0.0.0"
+port: 30001
+tp: 2
+mem_fraction_static: 0.88
+max_running_requests: 1000
+schedule_heuristic: "lpm"  # Options: "lpm", "round_robin", "fcfs", "dfs-weight"
+attention_backend: "flashinfer"  # Options: "flashinfer", "triton", "torch_native"
+context_length: 4096
+trust_remote_code: true

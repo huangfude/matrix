@@ -1,0 +1,1410 @@
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+use axum::{
+    extract::{Path, Query, Request, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
+    Json, Router,
+};
+use llm_tokenizer::TokenizerRegistry;
+use openai_protocol::{
+    chat::ChatCompletionRequest,
+    classify::ClassifyRequest,
+    completion::CompletionRequest,
+    embedding::EmbeddingRequest,
+    generate::GenerateRequest,
+    interactions::InteractionsRequest,
+    messages::CreateMessageRequest,
+    parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
+    realtime_session::{
+        RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
+        RealtimeTranscriptionSessionCreateRequest,
+    },
+    // V1RerankReqInput使用自定义的
+    rerank::RerankRequest,
+    responses::ResponsesRequest,
+    tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
+    validated::ValidatedJson,
+    worker::{WorkerSpec, WorkerUpdateRequest},
+};
+use rustls::crypto::ring;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use smg_mesh::{MeshServerBuilder, WorkerStateSubscriber};
+use tokio::{signal, spawn};
+use tracing::{debug, error, info, warn, Level};
+use wfaas::LoggingSubscriber;
+
+use smg::{
+    app_context::AppContext,
+    config::RoutingMode,
+    core::{
+        job_queue::{JobQueue, JobQueueConfig},
+        steps::{TokenizerConfigRequest, WorkflowEngines},
+        worker::WorkerType,
+        worker_manager::WorkerManager,
+        Job,
+    },
+    middleware,
+    observability::{
+        logging::{self, LoggingConfig},
+        metrics,
+        metrics_server,
+        metrics_ws::{collectors, registry::WatchRegistry},
+        otel_trace,
+    },
+    routers::{
+        conversations,
+        mesh::{
+            get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
+            get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
+            get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
+        },
+        openai::realtime::ws::RealtimeQueryParams,
+        parse, responses as response_handlers,
+        router_manager::RouterManager,
+        tokenize, RouterTrait,
+    },
+    service_discovery::start_service_discovery,
+    wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
+    server::{AppState, ServerConfig},
+};
+
+use super::middleware::{self as my_middleware, AuthConfig};
+
+use crate::{
+    conf::{MatrixConfig, RoutingModeExt},
+    workers::{WorkerRegistryExt, initialize_workers_from_config},
+    routers::{
+        RouterFactoryExt,
+        http::router_ext::RouterExt,
+    },
+    protocol::V1RerankReqInput,
+};
+
+async fn parse_function_call(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ParseFunctionCallRequest>,
+) -> Response {
+    parse::parse_function_call(&state.context, &req).await
+}
+
+async fn parse_reasoning(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SeparateReasoningRequest>,
+) -> Response {
+    parse::parse_reasoning(&state.context, &req).await
+}
+
+async fn sink_handler() -> Response {
+    StatusCode::NOT_FOUND.into_response()
+}
+
+async fn liveness() -> Response {
+    (StatusCode::OK, "OK").into_response()
+}
+
+async fn readiness(State(state): State<Arc<AppState>>) -> Response {
+    let workers = state.context.worker_registry.get_all();
+    let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
+
+    let is_ready = if state.context.router_config.enable_igw {
+        !healthy_workers.is_empty()
+    } else {
+        match &state.context.router_config.mode {
+            RoutingMode::PrefillDecode { .. } => {
+                let has_prefill = healthy_workers
+                    .iter()
+                    .any(|w| matches!(w.worker_type(), WorkerType::Prefill));
+                let has_decode = healthy_workers
+                    .iter()
+                    .any(|w| matches!(w.worker_type(), WorkerType::Decode));
+                has_prefill && has_decode
+            }
+            RoutingMode::Regular { .. } => !healthy_workers.is_empty(),
+            RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
+            RoutingMode::Anthropic { .. } => !healthy_workers.is_empty(),
+            RoutingMode::Gemini { .. } => !healthy_workers.is_empty(),
+        }
+    };
+
+    if is_ready {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ready",
+                "healthy_workers": healthy_workers.len(),
+                "total_workers": workers.len()
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not ready",
+                "reason": "insufficient healthy workers"
+            })),
+        )
+            .into_response()
+    }
+}
+
+async fn health(_state: State<Arc<AppState>>) -> Response {
+    liveness().await
+}
+
+async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    state.router.health_generate(req).await
+}
+
+async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
+    WorkerManager::get_engine_metrics(&state.context.worker_registry, &state.context.client)
+        .await
+        .into_response()
+}
+
+async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    state.router.get_server_info(req).await
+}
+
+async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    state.router.get_models(req).await
+}
+
+async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    state.router.get_model_info(req).await
+}
+
+async fn generate(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<GenerateRequest>,
+) -> Response {
+    state
+        .router
+        .route_generate(Some(&headers), &body, &body.model)
+        .await
+}
+
+async fn v1_chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+) -> Response {
+    state
+        .router
+        .route_chat(Some(&headers), &body, &body.model)
+        .await
+}
+
+async fn v1_completions(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    ValidatedJson(body): ValidatedJson<CompletionRequest>,
+) -> Response {
+    state
+        .router
+        .route_completion(Some(&headers), &body, &body.model)
+        .await
+}
+
+async fn rerank(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    ValidatedJson(body): ValidatedJson<RerankRequest>,
+) -> Response {
+    state
+        .router
+        .route_rerank(Some(&headers), &body, &body.model)
+        .await
+}
+
+async fn v1_rerank(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<V1RerankReqInput>,
+) -> Response {
+    // 目前社区的v1 rerank有BUG，这里先用自定义RouterExt中的的方法替换
+    // 转换 V1RerankReqInput 为 RerankRequest
+    let rerank_body: RerankRequest = body.into();
+
+    debug!(
+        "V1 rerank request received: model={}, query={}, documents_count={}",
+        rerank_body.model,
+        rerank_body.query,
+        rerank_body.documents.len()
+    );
+
+    // 直接处理 RouterManager 的情况，获取具体的 router
+    let router_any = state.router.as_any();
+    if let Some(router_manager) = router_any.downcast_ref::<RouterManager>() {
+        // 通过 select_router_for_request 获取具体的 router
+        match router_manager.select_router_for_request(Some(&headers), Some(&rerank_body.model)) {
+            Some(selected_router) => {
+                // 当 router 为 http::router::Router 类型时，使用 RouterExt 的特殊处理
+                RouterExt::route_rerank(selected_router, Some(&headers), &rerank_body, &rerank_body.model)
+                    .await
+            }
+            None => {
+                error!("No router available for rerank request");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "No router available",
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        // 原社区方法
+        // state
+        //     .router
+        //     .route_rerank(Some(&headers), &rerank_body, Some(&rerank_body.model))
+        //     .await
+        
+        // 使用RouterExt处理，兼容单router的情况
+        RouterExt::route_rerank(
+            state.router.clone(),
+            Some(&headers),
+            &rerank_body,
+            &rerank_body.model
+        ).await
+    }
+}
+
+async fn v1_responses(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    ValidatedJson(body): ValidatedJson<ResponsesRequest>,
+) -> Response {
+    state
+        .router
+        .route_responses(Some(&headers), &body, &body.model)
+        .await
+}
+
+async fn v1_interactions(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    ValidatedJson(body): ValidatedJson<InteractionsRequest>,
+) -> Response {
+    let model_id = body.model.as_deref().or(body.agent.as_deref());
+    state
+        .router
+        .route_interactions(Some(&headers), &body, model_id)
+        .await
+}
+
+async fn v1_embeddings(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<EmbeddingRequest>,
+) -> Response {
+    state
+        .router
+        .route_embeddings(Some(&headers), &body, &body.model)
+        .await
+}
+
+async fn v1_messages(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
+) -> Response {
+    state
+        .router
+        .route_messages(Some(&headers), &body, &body.model)
+        .await
+}
+
+async fn v1_classify(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<ClassifyRequest>,
+) -> Response {
+    state
+        .router
+        .route_classify(Some(&headers), &body, &body.model)
+        .await
+}
+
+async fn v1_responses_get(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+) -> Response {
+    response_handlers::get_response(&state.context.response_storage, &response_id).await
+}
+
+async fn v1_responses_cancel(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .cancel_response(Some(&headers), &response_id)
+        .await
+}
+
+async fn v1_responses_delete(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+) -> Response {
+    response_handlers::delete_response(&state.context.response_storage, &response_id).await
+}
+
+async fn v1_responses_list_input_items(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+) -> Response {
+    response_handlers::list_response_input_items(&state.context.response_storage, &response_id)
+        .await
+}
+
+async fn v1_conversations_create(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<Value>,
+) -> Response {
+    conversations::create_conversation(&state.context.conversation_storage, body).await
+}
+
+async fn v1_conversations_get(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+) -> Response {
+    conversations::get_conversation(&state.context.conversation_storage, &conversation_id).await
+}
+
+async fn v1_conversations_update(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    conversations::update_conversation(&state.context.conversation_storage, &conversation_id, body)
+        .await
+}
+
+async fn v1_conversations_delete(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+) -> Response {
+    conversations::delete_conversation(&state.context.conversation_storage, &conversation_id).await
+}
+
+#[derive(Deserialize, Default)]
+struct ListItemsQuery {
+    limit: Option<usize>,
+    order: Option<String>,
+    after: Option<String>,
+}
+
+async fn v1_conversations_list_items(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    Query(ListItemsQuery {
+        limit,
+        order,
+        after,
+    }): Query<ListItemsQuery>,
+) -> Response {
+    conversations::list_conversation_items(
+        &state.context.conversation_storage,
+        &state.context.conversation_item_storage,
+        &conversation_id,
+        limit,
+        order.as_deref(),
+        after.as_deref(),
+    )
+    .await
+}
+
+#[derive(Deserialize, Default)]
+struct GetItemQuery {
+    /// Additional fields to include in response (not yet implemented)
+    include: Option<Vec<String>>,
+}
+
+async fn v1_conversations_create_items(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    conversations::create_conversation_items(
+        &state.context.conversation_storage,
+        &state.context.conversation_item_storage,
+        &conversation_id,
+        body,
+    )
+    .await
+}
+
+async fn v1_conversations_get_item(
+    State(state): State<Arc<AppState>>,
+    Path((conversation_id, item_id)): Path<(String, String)>,
+    Query(query): Query<GetItemQuery>,
+) -> Response {
+    conversations::get_conversation_item(
+        &state.context.conversation_storage,
+        &state.context.conversation_item_storage,
+        &conversation_id,
+        &item_id,
+        query.include,
+    )
+    .await
+}
+
+async fn v1_conversations_delete_item(
+    State(state): State<Arc<AppState>>,
+    Path((conversation_id, item_id)): Path<(String, String)>,
+) -> Response {
+    conversations::delete_conversation_item(
+        &state.context.conversation_storage,
+        &state.context.conversation_item_storage,
+        &conversation_id,
+        &item_id,
+    )
+    .await
+}
+
+async fn v1_realtime_webrtc(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<RealtimeQueryParams>,
+    req: Request,
+) -> Response {
+    // Model may come from query param (application/sdp) or session body
+    // (multipart/form-data). Let the handler validate per content type.
+    let model = params.model.unwrap_or_default();
+    state.router.route_realtime_webrtc(req, &model).await
+}
+
+async fn v1_realtime_ws(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<RealtimeQueryParams>,
+    req: Request,
+) -> Response {
+    let model = match params.model {
+        Some(m) if !m.trim().is_empty() => m,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Missing required 'model' query parameter",
+            )
+                .into_response();
+        }
+    };
+    state.router.route_realtime_ws(req, &model).await
+}
+
+async fn v1_realtime_session(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    ValidatedJson(body): ValidatedJson<RealtimeSessionCreateRequest>,
+) -> Response {
+    state
+        .router
+        .route_realtime_session(Some(&headers), &body)
+        .await
+}
+
+async fn v1_realtime_client_secret(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    ValidatedJson(body): ValidatedJson<RealtimeClientSecretCreateRequest>,
+) -> Response {
+    state
+        .router
+        .route_realtime_client_secret(Some(&headers), &body)
+        .await
+}
+
+async fn v1_realtime_transcription_session(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    ValidatedJson(body): ValidatedJson<RealtimeTranscriptionSessionCreateRequest>,
+) -> Response {
+    state
+        .router
+        .route_realtime_transcription_session(Some(&headers), &body)
+        .await
+}
+
+async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
+    WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
+        .await
+        .into_response()
+}
+
+async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
+    WorkerManager::get_all_worker_loads(&state.context.worker_registry, &state.context.client)
+        .await
+        .into_response()
+}
+
+async fn create_worker(
+    State(state): State<Arc<AppState>>,
+    Json(config): Json<WorkerSpec>,
+) -> Response {
+    match state.context.worker_service.create_worker(config).await {
+        Ok(result) => result.into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
+    state.context.worker_service.list_workers().into_response()
+}
+
+async fn get_worker(
+    State(state): State<Arc<AppState>>,
+    Path(worker_id_raw): Path<String>,
+) -> Response {
+    match state.context.worker_service.get_worker(&worker_id_raw) {
+        Ok(result) => result.into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn delete_worker(
+    State(state): State<Arc<AppState>>,
+    Path(worker_id_raw): Path<String>,
+) -> Response {
+    match state
+        .context
+        .worker_service
+        .delete_worker(&worker_id_raw)
+        .await
+    {
+        Ok(result) => result.into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn update_worker(
+    State(state): State<Arc<AppState>>,
+    Path(worker_id_raw): Path<String>,
+    Json(update): Json<WorkerUpdateRequest>,
+) -> Response {
+    match state
+        .context
+        .worker_service
+        .update_worker(&worker_id_raw, update)
+        .await
+    {
+        Ok(result) => result.into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn replace_worker(
+    State(state): State<Arc<AppState>>,
+    Path(worker_id_raw): Path<String>,
+    Json(config): Json<WorkerSpec>,
+) -> Response {
+    match state
+        .context
+        .worker_service
+        .replace_worker(&worker_id_raw, config)
+        .await
+    {
+        Ok(result) => result.into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+// ============================================================================
+// Tokenize / Detokenize Handlers
+// ============================================================================
+
+async fn v1_tokenize(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TokenizeRequest>,
+) -> Response {
+    tokenize::tokenize(&state.context.tokenizer_registry, request).await
+}
+
+async fn v1_detokenize(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<DetokenizeRequest>,
+) -> Response {
+    tokenize::detokenize(&state.context.tokenizer_registry, request).await
+}
+
+async fn v1_tokenizers_add(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AddTokenizerRequest>,
+) -> Response {
+    tokenize::add_tokenizer(&state.context, request).await
+}
+
+async fn v1_tokenizers_list(State(state): State<Arc<AppState>>) -> Response {
+    tokenize::list_tokenizers(&state.context.tokenizer_registry).await
+}
+
+async fn v1_tokenizers_get(
+    State(state): State<Arc<AppState>>,
+    Path(tokenizer_id): Path<String>,
+) -> Response {
+    tokenize::get_tokenizer_info(&state.context, &tokenizer_id).await
+}
+
+async fn v1_tokenizers_status(
+    State(state): State<Arc<AppState>>,
+    Path(tokenizer_id): Path<String>,
+) -> Response {
+    tokenize::get_tokenizer_status(&state.context, &tokenizer_id).await
+}
+
+async fn v1_tokenizers_remove(
+    State(state): State<Arc<AppState>>,
+    Path(tokenizer_id): Path<String>,
+) -> Response {
+    tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
+}
+
+pub fn build_app(
+    app_state: Arc<AppState>,
+    auth_config: AuthConfig,
+    control_plane_auth_state: Option<smg_auth::ControlPlaneAuthState>,
+    max_payload_size: usize,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+) -> Router {
+    // Pending (upgrade not completed): 30s TTL
+    // Disconnected: 60 min TTL
+    app_state.context.realtime_registry.start_reaper(
+        Duration::from_secs(3600),
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+    );
+
+    let protected_routes = Router::new()
+        .route("/v1/responses", post(v1_responses))
+        .route("/v1/responses/{response_id}", get(v1_responses_get))
+        .route(
+            "/v1/responses/{response_id}/cancel",
+            post(v1_responses_cancel),
+        )
+        .route("/v1/responses/{response_id}", delete(v1_responses_delete))
+        .route(
+            "/v1/responses/{response_id}/input_items",
+            get(v1_responses_list_input_items),
+        )
+        .route("/v1/conversations", post(v1_conversations_create))
+        .route(
+            "/v1/conversations/{conversation_id}",
+            get(v1_conversations_get)
+                .post(v1_conversations_update)
+                .delete(v1_conversations_delete),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items",
+            get(v1_conversations_list_items).post(v1_conversations_create_items),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items/{item_id}",
+            get(v1_conversations_get_item).delete(v1_conversations_delete_item),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::storage_context_middleware,
+        ))
+        .route("/generate", post(generate))
+        .route("/v1/chat/completions", post(v1_chat_completions))
+        .route("/v1/completions", post(v1_completions))
+        .route("/rerank", post(rerank))
+        .route("/v1/rerank", post(v1_rerank))
+        .route("/v1/embeddings", post(v1_embeddings))
+        .route("/v1/messages", post(v1_messages))
+        .route("/v1/interactions", post(v1_interactions))
+        .route("/v1/classify", post(v1_classify))
+        // Tokenize / Detokenize endpoints
+        .route("/v1/tokenize", post(v1_tokenize))
+        .route("/v1/detokenize", post(v1_detokenize))
+        // Realtime REST endpoints (same middleware as other protected routes)
+        .route("/v1/realtime/sessions", post(v1_realtime_session))
+        .route(
+            "/v1/realtime/client_secrets",
+            post(v1_realtime_client_secret),
+        )
+        .route(
+            "/v1/realtime/transcription_sessions",
+            post(v1_realtime_transcription_session),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::concurrency_limit_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            my_middleware::auth_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::wasm_middleware,
+        ));
+
+    // WebSocket and WebRTC routes: auth + concurrency but NO WASM middleware.
+    // WASM OnResponse reconstructs the response from status/headers/body,
+    // dropping the response extensions that carry the WebSocket upgrade future.
+    let realtime_routes = Router::new()
+        .route("/v1/realtime", get(v1_realtime_ws))
+        .route("/v1/realtime/calls", post(v1_realtime_webrtc))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::concurrency_limit_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            my_middleware::auth_middleware,
+        ));
+
+    let public_routes = Router::new()
+        .route("/liveness", get(liveness))
+        .route("/readiness", get(readiness))
+        .route("/health", get(health))
+        .route("/health_generate", get(health_generate))
+        .route("/engine_metrics", get(engine_metrics))
+        .route("/v1/models", get(v1_models))
+        .route("/get_model_info", get(get_model_info))
+        .route("/get_server_info", get(get_server_info));
+
+    // Build admin routes with control plane auth if configured, otherwise use simple API key auth
+    let admin_routes = Router::new()
+        .route("/flush_cache", post(flush_cache))
+        .route("/get_loads", get(get_loads))
+        .route("/parse/function_call", post(parse_function_call))
+        .route("/parse/reasoning", post(parse_reasoning))
+        .route("/wasm", post(add_wasm_module))
+        .route("/wasm/{module_uuid}", delete(remove_wasm_module))
+        .route("/wasm", get(list_wasm_modules))
+        // Tokenizer management endpoints
+        .route(
+            "/v1/tokenizers",
+            post(v1_tokenizers_add).get(v1_tokenizers_list),
+        )
+        .route(
+            "/v1/tokenizers/{tokenizer_id}",
+            get(v1_tokenizers_get).delete(v1_tokenizers_remove),
+        )
+        .route(
+            "/v1/tokenizers/{tokenizer_id}/status",
+            get(v1_tokenizers_status),
+        );
+
+    // Build worker routes
+    let worker_routes = Router::new()
+        .route("/workers", post(create_worker).get(list_workers_rest))
+        .route(
+            "/workers/{worker_id}",
+            get(get_worker)
+                .put(replace_worker)
+                .patch(update_worker)
+                .delete(delete_worker),
+        );
+
+    // Apply authentication middleware to control plane routes
+    let apply_control_plane_auth = |routes: Router<Arc<AppState>>| {
+        if let Some(ref cp_state) = control_plane_auth_state {
+            routes.route_layer(axum::middleware::from_fn_with_state(
+                cp_state.clone(),
+                smg_auth::control_plane_auth_middleware,
+            ))
+        } else {
+            routes.route_layer(axum::middleware::from_fn_with_state(
+                auth_config.clone(),
+                my_middleware::auth_middleware,
+            ))
+        }
+    };
+    let admin_routes = apply_control_plane_auth(admin_routes);
+    let worker_routes = apply_control_plane_auth(worker_routes);
+
+    // HA management routes
+    let mesh_routes = Router::new()
+        .route("/ha/status", get(get_cluster_status))
+        .route("/ha/health", get(get_mesh_health))
+        .route("/ha/workers", get(get_worker_states))
+        .route("/ha/workers/{worker_id}", get(get_worker_state))
+        .route("/ha/policies", get(get_policy_states))
+        .route("/ha/policies/{model_id}", get(get_policy_state))
+        .route("/ha/config/{key}", get(get_app_config))
+        .route("/ha/config", post(update_app_config))
+        .route("/ha/rate-limit", post(set_global_rate_limit))
+        .route("/ha/rate-limit", get(get_global_rate_limit))
+        .route("/ha/rate-limit/stats", get(get_global_rate_limit_stats))
+        .route("/ha/shutdown", post(trigger_graceful_shutdown))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            my_middleware::auth_middleware,
+        ));
+
+    Router::new()
+        .merge(protected_routes)
+        .merge(realtime_routes)
+        .merge(public_routes)
+        .merge(admin_routes)
+        .merge(worker_routes)
+        .merge(mesh_routes)
+        .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            max_payload_size,
+        ))
+        .layer(my_middleware::create_logging_layer())
+        .layer(middleware::HttpMetricsLayer::new(
+            app_state.context.inflight_tracker.clone(),
+        ))
+        .layer(my_middleware::RequestIdLayer::new(request_id_headers))
+        .layer(create_cors_layer(cors_allowed_origins))
+        .fallback(sink_handler)
+        .with_state(app_state)
+}
+
+pub async fn startup(config: ServerConfig, matrix_config: MatrixConfig) -> Result<(), Box<dyn std::error::Error>> {
+    static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+    if let Some(trace_config) = &config.router_config.trace_config {
+        otel_trace::otel_tracing_init(
+            trace_config.enable_trace,
+            Some(&trace_config.otlp_traces_endpoint),
+        )?;
+    }
+
+    let _log_guard = if LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
+        None
+    } else {
+        Some(logging::init_logging(
+            LoggingConfig {
+                level: config
+                    .log_level
+                    .as_deref()
+                    .and_then(|s| match s.to_uppercase().parse::<Level>() {
+                        Ok(l) => Some(l),
+                        Err(_) => {
+                            warn!("Invalid log level string: '{s}'. Defaulting to INFO.");
+                            None
+                        }
+                    })
+                    .unwrap_or(Level::INFO),
+                json_format: config.log_json,
+                log_dir: config.log_dir.clone(),
+                colorize: true,
+                log_file_name: "matrix_router".to_string(),
+                log_targets: Some(vec!["matrix_router".to_string(), "smg".to_string()]),
+            },
+            config.router_config.trace_config.clone(),
+        ))
+    };
+
+    // Start metrics server and collectors.
+    // Metrics server binds the port now; collectors start after AppContext is built.
+    let (prometheus_handle, watch_registry) =
+        if let Some(prometheus_config) = &config.prometheus_config {
+            let handle = metrics::start_prometheus(prometheus_config.clone());
+            let registry = Arc::new(WatchRegistry::new());
+            let _server_handle = metrics_server::start_metrics_server(
+                handle.clone(),
+                prometheus_config.host.clone(),
+                prometheus_config.port,
+                registry.clone(),
+                metrics_server::DEFAULT_MAX_WS_CONNECTIONS,
+            )
+            .await;
+            (Some(handle), Some(registry))
+        } else {
+            (None, None)
+        };
+
+    // Initialize mesh server if configured, it will return a handler for mesh management
+    let mesh_handler = if let Some(mesh_server_config) = &config.mesh_server_config {
+        // Create mesh server builder and build with stores
+        let (mesh_server, handler) = MeshServerBuilder::from(mesh_server_config).build();
+
+        // Start rate limit window reset task (managed by handler)
+        handler.start_rate_limit_task(1); // Reset every 1 second
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
+        )]
+        spawn(async move {
+            if let Err(e) = mesh_server.start().await {
+                tracing::error!("Mesh server failed: {}", e);
+            }
+        });
+
+        Some(Arc::new(handler))
+    } else {
+        None
+    };
+
+    info!(
+        "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
+        config.host,
+        config.port,
+        config.router_config.mode,
+        config.router_config.policy,
+        config.max_payload_size / (1024 * 1024)
+    );
+
+    let app_context = Arc::new(
+        AppContext::from_config(
+            config.router_config.clone(),
+            config.request_timeout_secs,
+            config.webrtc_bind_addr,
+            config.webrtc_stun_server.clone(),
+        )
+        .await?,
+    );
+
+    if config.prometheus_config.is_some() {
+        app_context.inflight_tracker.start_sampler(20);
+    }
+
+    // Start WS metrics collectors now that AppContext is available.
+    let _collector_handles = match (&prometheus_handle, &watch_registry) {
+        (Some(handle), Some(registry)) => Some(collectors::start_collectors(
+            app_context.clone(),
+            registry.clone(),
+            collectors::CollectorConfig::default(),
+            handle.clone(),
+        )),
+        _ => None,
+    };
+
+    let weak_context = Arc::downgrade(&app_context);
+    let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
+    #[expect(
+        clippy::expect_used,
+        reason = "OnceLock initialization during startup; double-init is a fatal bug"
+    )]
+    app_context
+        .worker_job_queue
+        .set(worker_job_queue)
+        .expect("JobQueue should only be initialized once");
+
+    // Initialize typed workflow engines
+    let engines = WorkflowEngines::new(&config.router_config);
+
+    // Subscribe logging to all workflow engines
+    engines.subscribe_all(Arc::new(LoggingSubscriber)).await;
+
+    #[expect(
+        clippy::expect_used,
+        reason = "OnceLock initialization during startup; double-init is a fatal bug"
+    )]
+    app_context
+        .workflow_engines
+        .set(engines)
+        .expect("WorkflowEngines should only be initialized once");
+    debug!(
+        "Workflow engines initialized (health check timeout: {}s)",
+        config.router_config.health_check.timeout_secs
+    );
+
+    // Submit startup tokenizer job if tokenizer path is configured
+    // This runs before worker initialization to ensure tokenizer is available
+    if config.router_config.disable_tokenizer_autoload {
+        info!("Tokenizer autoload disabled via config; skipping startup tokenizer load");
+    } else if let Some(tokenizer_source) = config
+        .router_config
+        .tokenizer_path
+        .as_ref()
+        .or(config.router_config.model_path.as_ref())
+    {
+        info!("Loading startup tokenizer from: {}", tokenizer_source);
+
+        #[expect(
+            clippy::expect_used,
+            reason = "JobQueue was just initialized above; absence is unreachable"
+        )]
+        let job_queue = app_context
+            .worker_job_queue
+            .get()
+            .expect("JobQueue should be initialized");
+
+        let tokenizer_config = TokenizerConfigRequest {
+            id: TokenizerRegistry::generate_id(),
+            name: tokenizer_source.clone(),
+            source: tokenizer_source.clone(),
+            chat_template_path: config.router_config.chat_template.clone(),
+            cache_config: config.router_config.tokenizer_cache.to_option(),
+            fail_on_duplicate: false,
+        };
+
+        let job = Job::AddTokenizer {
+            config: Box::new(tokenizer_config),
+        };
+
+        job_queue
+            .submit(job)
+            .await
+            .map_err(|e| format!("Failed to submit startup tokenizer job: {e}"))?;
+
+        info!("Startup tokenizer job submitted (will complete in background)");
+    }
+
+    info!(
+        "Initializing workers for routing mode: {:?}",
+        config.router_config.mode
+    );
+
+    // Submit worker initialization job to queue
+    #[expect(
+        clippy::expect_used,
+        reason = "JobQueue was initialized above; absence is unreachable"
+    )]
+    let job_queue = app_context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue should be initialized");
+    
+    let _ = initialize_workers_from_config(matrix_config.static_models, &config.router_config.clone(), &app_context).await;
+
+    if let Some(mcp_config) = &config.router_config.mcp_config {
+        info!("Found {} MCP server(s) in config", mcp_config.servers.len());
+        let mcp_job = Job::InitializeMcpServers {
+            mcp_config: Box::new(mcp_config.clone()),
+        };
+        job_queue
+            .submit(mcp_job)
+            .await
+            .map_err(|e| format!("Failed to submit MCP initialization job: {e}"))?;
+    } else {
+        info!("No MCP config provided, skipping MCP server initialization");
+    }
+
+    // Note: MCP orchestrator handles background refresh internally via refresh channel
+    // configured by inventory.refresh_interval in mcp.yaml
+
+    let worker_stats = app_context.worker_registry.stats();
+    info!(
+        "Workers initialized: {} total, {} healthy",
+        worker_stats.total_workers, worker_stats.healthy_workers
+    );
+
+    let (router, router_manager) : (Arc<dyn RouterTrait>, Option<Arc<RouterManager>>) =
+        if !matches!(matrix_config.routing_mode_ext, RoutingModeExt::TBD) {
+            info!("Router mode extended");
+            // Create single router with the context
+            let router: Arc<dyn RouterTrait> = Arc::from(RouterFactoryExt::create_router(&app_context, matrix_config.routing_mode_ext).await?);
+            (router, None)
+        } else {
+            let router_manager = RouterManager::from_config(&config, &app_context).await?;
+            let router: Arc<dyn RouterTrait> = router_manager.clone();
+            (router, Some(router_manager))
+        };
+
+    // Health checker handle must outlive the server to keep the background task alive.
+    // HealthChecker aborts its task on Drop, so binding it here keeps it alive until
+    // the server shuts down.
+    let _health_checker = if config.router_config.health_check.disable_health_check {
+        info!("Global health checks disabled via CLI/config; skipping health checker");
+        None
+    } else {
+        let worker_registry_ext = WorkerRegistryExt::new(app_context.worker_registry.clone());
+        let hc = worker_registry_ext.start_health_checker(
+            config.router_config.health_check.check_interval_secs,
+            config.router_config.health_check.remove_unhealthy_workers,
+            app_context.worker_job_queue.get().cloned(),
+        );
+        debug!(
+            "Started health checker for workers with {}s interval",
+            config.router_config.health_check.check_interval_secs
+        );
+        Some(hc)
+    };
+
+    // LoadMonitor groups are started dynamically when workers are registered.
+    // No explicit start() needed — see RegisterWorkersStep.
+    if app_context.load_monitor.is_some() {
+        debug!("LoadMonitor initialized (groups start on worker registration)");
+    }
+
+    let (limiter, processor) = middleware::ConcurrencyLimiter::new(
+        app_context.rate_limiter.clone(),
+        config.router_config.queue_size,
+        Duration::from_secs(config.router_config.queue_timeout_secs),
+    );
+
+    if app_context.rate_limiter.is_none() {
+        info!("Rate limiting is disabled (max_concurrent_requests = -1)");
+    }
+
+    match processor {
+        Some(proc) => {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "request queue processor runs for the lifetime of the server"
+            )]
+            spawn(proc.run());
+            debug!(
+                "Started request queue (size: {}, timeout: {}s)",
+                config.router_config.queue_size, config.router_config.queue_timeout_secs
+            );
+        }
+        None => {
+            debug!(
+                "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
+                config.router_config.max_concurrent_requests
+            );
+        }
+    }
+
+    // Set mesh sync manager to worker registry and policy registry if mesh is enabled
+    // This allows these components to sync state across mesh nodes when mesh is enabled,
+    // but they work independently without mesh when mesh is disabled.
+    // Using thread-safe set_mesh_sync method that works with Arc-wrapped registries
+    if let Some(ref handle) = mesh_handler {
+        app_context
+            .worker_registry
+            .set_mesh_sync(Some(handle.sync_manager.clone()));
+        handle
+            .sync_manager
+            .register_worker_state_subscriber(app_context.worker_registry.clone());
+        // Replay workers already in the CRDT store — they arrived between
+        // mesh server start and subscriber registration above.
+        for state in handle.sync_manager.get_all_worker_states() {
+            app_context.worker_registry.on_remote_worker_state(&state);
+        }
+        info!("Mesh sync manager set on worker registry");
+
+        handle
+            .sync_manager
+            .register_tree_state_subscriber(app_context.policy_registry.clone());
+        app_context
+            .policy_registry
+            .set_mesh_sync(Some(handle.sync_manager.clone()));
+        info!("Mesh sync manager set on policy registry");
+    }
+
+    // Get mesh cluster state and port before moving mesh_handler into app_state
+    let mesh_cluster_state = mesh_handler.as_ref().map(|h| h.state.clone());
+    let mesh_port = config
+        .mesh_server_config
+        .as_ref()
+        .map(|c| c.advertise_addr.port());
+
+    let app_state = Arc::new(AppState {
+        router,
+        context: app_context.clone(),
+        concurrency_queue_tx: limiter.queue_tx.clone(),
+        router_manager: router_manager,
+        mesh_handler,
+    });
+    if let Some(service_discovery_config) = config.service_discovery_config {
+        if service_discovery_config.enabled {
+            let app_context_arc = Arc::clone(&app_state.context);
+
+            match start_service_discovery(
+                service_discovery_config,
+                app_context_arc,
+                mesh_cluster_state,
+                mesh_port,
+            )
+            .await
+            {
+                Ok(handle) => {
+                    info!("Service discovery started");
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "service discovery runs for the lifetime of the server"
+                    )]
+                    spawn(async move {
+                        if let Err(e) = handle.await {
+                            error!("Service discovery task failed: {:?}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to start service discovery: {e}");
+                    warn!("Continuing without service discovery");
+                }
+            }
+        }
+    }
+
+    info!(
+        "Router ready | workers: {:?}",
+        WorkerManager::get_worker_urls(&app_state.context.worker_registry)
+    );
+
+    let request_id_headers = config.request_id_headers.clone().unwrap_or_else(|| {
+        vec![
+            "x-request-id".to_string(),
+            "x-correlation-id".to_string(),
+            "x-trace-id".to_string(),
+            "request-id".to_string(),
+        ]
+    });
+
+    let mut data_plane_api_keys = matrix_config.data_plane_api_keys.clone();
+    if let Some(api_key) = &config.router_config.api_key {
+        if let Some(ref mut keys) = data_plane_api_keys {
+            keys.push(api_key.clone());
+        } else {
+            data_plane_api_keys = Some(vec![api_key.clone()]);
+        }
+    }
+    let auth_config = AuthConfig::new(data_plane_api_keys);
+
+    // Initialize control plane authentication if configured
+    let control_plane_auth_state =
+        smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
+
+    let app = build_app(
+        app_state,
+        auth_config,
+        control_plane_auth_state,
+        config.max_payload_size,
+        request_id_headers,
+        config.router_config.cors_allowed_origins.clone(),
+    );
+
+    // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
+    let bind_addr = format!("{}:{}", config.host, config.port);
+    info!("Starting server on {}", bind_addr);
+
+    // Parse address and set up graceful shutdown (common to both TLS and non-TLS)
+    let addr: std::net::SocketAddr = bind_addr
+        .parse()
+        .map_err(|e| format!("Invalid address: {e}"))?;
+
+    let handle = axum_server::Handle::new();
+    let handle_clone = handle.clone();
+    let inflight_tracker = app_context.inflight_tracker.clone();
+    let drain_timeout = Duration::from_secs(config.shutdown_grace_period_secs);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "shutdown signal handler must outlive the server to trigger graceful shutdown"
+    )]
+    spawn(async move {
+        shutdown_signal().await;
+
+        // Phase 1: Gate — stop accepting new connections, mark as draining
+        info!(
+            in_flight = inflight_tracker.len(),
+            "Beginning graceful shutdown: gating new connections"
+        );
+        inflight_tracker.begin_drain();
+        handle_clone.graceful_shutdown(Some(drain_timeout));
+
+        // Phase 2: Drain — wait for in-flight requests to complete
+        // Re-check after gating to catch requests that arrived between the
+        // snapshot and graceful_shutdown stopping the accept loop.
+        if !inflight_tracker.is_empty() {
+            let drained = inflight_tracker.wait_for_drain(drain_timeout).await;
+            if drained {
+                info!("All in-flight requests drained");
+            } else {
+                warn!(
+                    remaining = inflight_tracker.len(),
+                    timeout_secs = drain_timeout.as_secs(),
+                    "Drain timed out, forcing shutdown with requests still in-flight"
+                );
+            }
+        }
+        // Phase 3: Teardown proceeds after axum server stops (in the main task)
+    });
+
+    let server_result = if let (Some(cert), Some(key)) = (
+        &config.router_config.server_cert,
+        &config.router_config.server_key,
+    ) {
+        info!("TLS enabled");
+        ring::default_provider()
+            .install_default()
+            .map_err(|e| format!("Failed to install rustls ring provider: {e:?}"))?;
+
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
+            .await
+            .map_err(|e| format!("Failed to create TLS config: {e}"))?;
+
+        axum_server::bind_rustls(addr, tls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+    } else {
+        axum_server::bind(addr)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+    };
+
+    // Graceful Shutdown
+
+    info!("HTTP server stopped. Starting component cleanup...");
+
+    // This triggers background task cancellation, waits for tools, and denies approvals
+    if let Some(orchestrator) = app_context.mcp_orchestrator.get() {
+        orchestrator.shutdown().await;
+    }
+
+    info!("Cleanup complete. Process exiting.");
+
+    // Return original server error if any, otherwise Ok
+    server_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "signal handler installation is infallible on supported platforms; failure is fatal"
+)]
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {
+            info!("Received Ctrl+C, starting graceful shutdown");
+        },
+        () = terminate => {
+            info!("Received terminate signal, starting graceful shutdown");
+        },
+    }
+}
+
+fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLayer {
+    use tower_http::cors::Any;
+
+    let cors = if allowed_origins.is_empty() {
+        tower_http::cors::CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+            .expose_headers(Any)
+    } else {
+        let origins: Vec<http::HeaderValue> = allowed_origins
+            .into_iter()
+            .filter_map(|origin| origin.parse().ok())
+            .collect();
+
+        tower_http::cors::CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([http::Method::GET, http::Method::POST, http::Method::OPTIONS])
+            .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION])
+            .expose_headers([http::header::HeaderName::from_static("x-request-id")])
+    };
+
+    cors.max_age(Duration::from_secs(3600))
+}

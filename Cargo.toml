@@ -1,0 +1,44 @@
+[workspace]
+members = ["matrix_router", "matrix_cli"]
+resolver = "2"
+
+[workspace.dependencies]
+# Common dependencies
+axum = { version = "0.8.6", features = ["macros", "ws", "tracing"] }
+clap = { version = "4.0", features = ["derive", "env"] }
+futures = "0.3.32"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["std", "preserve_order"] }
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
+thiserror = "2.0"
+anyhow = "1.0"
+jiff = "0.2"
+tower = { version = "0.5", features = ["util", "full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "timeout", "limit", "request-id", "util"] }
+maplit = "1.0"
+twox-hash = "1.6"
+
+# smg dependencies
+smg = { version = "=1.4.1", features = ["default"] }
+smg-auth = "=1.1.1"
+smg-mesh = "=1.3.0"
+tool-parser = "=1.2.0"
+reasoning-parser = "=1.2.3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+todo = "deny"
+unwrap_used = "deny"
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+
+[profile.dev]
+incremental = true

@@ -1,0 +1,49 @@
+FROM quay.mirrorify.net/openeuler/openeuler:24.03
+
+# Ensure apt-get won't prompt for selecting options
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG C.UTF-8
+ENV LC_ALL C.UTF-8
+
+RUN sed -i 's|repo.openeuler.org|mirrors.aliyun.com/openeuler|g' /etc/yum.repos.d/openEuler.repo
+RUN sed -i '/^metalink=/ s/^/#/' /etc/yum.repos.d/openEuler.repo
+# openeuler 关闭update标识
+RUN sed -i '/^\[update\]$/,/^\[.*\]$/ s/^enabled=1$/enabled=0/' /etc/yum.repos.d/openEuler.repo
+RUN sed -i '/^\[update-source\]$/,/^\[.*\]$/ s/^enabled=1$/enabled=0/' /etc/yum.repos.d/openEuler.repo
+
+# build/dev dependencies
+RUN dnf makecache && \
+    dnf install -yq python3-devel python3-pip protobuf-devel protobuf-compiler openssl-devel net-tools pkgconfig
+
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+RUN pip config set install.trusted-host mirrors.aliyun.com
+
+RUN mkdir -p /opt/venv && \
+    python3 -m venv /opt/venv && \
+    . /opt/venv/bin/activate && \
+    pip install --upgrade pip
+
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# 工作目录 
+WORKDIR /workspace
+
+# 安装编译和单元测试依赖
+RUN pip install build setuptools wheel coverage pytest pytest-cov pytest-xdist pytest-asyncio httpx 
+
+COPY LICENSE .
+COPY README.md .
+
+# python code
+RUN mkdir /workspace/matrix_router
+COPY matrix_router /workspace/matrix_router/
+
+# 编译
+RUN python3 -m build ./matrix_router --wheel --outdir ./dist
+
+# 安装依赖
+RUN pip install ./dist/matrix_router-*.whl && pip uninstall matrix-router -y
+
+# 清理
+RUN rm -rf /workspace/*
