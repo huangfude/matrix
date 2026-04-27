@@ -105,6 +105,26 @@ class TestCLIVersion:
             assert exc_info.value.code == 0
             mock_logger_info.assert_called_once()
 
+    @pytest.mark.parametrize(
+        ("flag", "expected_version"),
+        [
+            ("--version", "matrix-cli 0.0.1"),
+            ("--version-verbose", "matrix-cli 0.0.1\n\nRust extension: not installed"),
+        ],
+    )
+    def test_main_with_version_flag_without_rust_extension(self, flag, expected_version):
+        """Test CLI version fallback when the Rust extension is unavailable."""
+        from matrix_cli.cli import main
+
+        with patch.dict(sys.modules, {"matrix_cli.matrix_cli_rs": None}):
+            with patch.object(logger, "info") as mock_logger_info:
+                mock_logger_info.return_value = None
+                with pytest.raises(SystemExit) as exc_info:
+                    main([flag])
+
+                assert exc_info.value.code == 0
+                mock_logger_info.assert_called_once_with(expected_version)
+
 
 class TestCLICommandParsing:
     """Test CLI command parsing."""
