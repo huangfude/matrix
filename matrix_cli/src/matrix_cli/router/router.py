@@ -15,6 +15,8 @@ from matrix_cli.matrix_cli_rs import (
 )
 from matrix_cli.matrix_cli_rs import Router as _Router
 
+from matrix_cli.utils import runtime_backend
+from matrix_cli.log import logger
 
 def policy_from_str(policy_str: str | None) -> PolicyType:
     """Convert policy string to PolicyType enum."""
@@ -34,6 +36,10 @@ def policy_from_str(policy_str: str | None) -> PolicyType:
 
 
 def backend_from_str(backend_str: str | None) -> BackendType:
+    backend = runtime_backend()
+    if backend is not None and backend_str != backend:
+        logger.warning(f"Reset to the available {backend} backend.")
+        backend_str = backend
     """Convert backend string to BackendType enum."""
     if isinstance(backend_str, BackendType):
         return backend_str

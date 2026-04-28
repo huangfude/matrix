@@ -9,6 +9,9 @@ import subprocess
 import sys
 from typing import Any
 import yaml
+import importlib.util
+
+from matrix_cli.log import logger
 
 
 def load_config(config_path: str) -> dict[str, Any]:
@@ -97,6 +100,15 @@ def parse_backend_args(parser: argparse.ArgumentParser, args: list[str]) -> argp
 
     return result
 
+def runtime_backend() -> str | None:
+    """Detect the installed runtime backend package."""
+    if importlib.util.find_spec("sglang") is not None:
+        return "sglang"
+    if importlib.util.find_spec("vllm") is not None:
+        return "vllm"
+    logger.warning("No vLLM or SGLang detected in the runtime environment.")
+    return None
+
 
 def launch_backend(cmd: list[str], backend_name: str) -> None:
     """Generic function to launch a backend process.
@@ -109,7 +121,7 @@ def launch_backend(cmd: list[str], backend_name: str) -> None:
     if not cmd:
         raise OSError("Cannot execute empty command list")
 
-    print(f"Launching {backend_name} with command: {' '.join(cmd)}")
+    logger.info(f"Launching {backend_name} with command: {' '.join(cmd)}")
 
     try:
         # Execute the backend server
@@ -118,17 +130,17 @@ def launch_backend(cmd: list[str], backend_name: str) -> None:
         return_code = process.wait()
         sys.exit(return_code)
     except subprocess.CalledProcessError as e:
-        print(f"{backend_name} server failed with return code {e.returncode}: {e}")
+        logger.error(f"{backend_name} server failed with return code {e.returncode}: {e}")
         sys.exit(e.returncode)
     except FileNotFoundError:
-        print(f"Error: {backend_name} is not installed or not available in PATH.")
+        logger.error(f"Error: {backend_name} is not installed or not available in PATH.")
         if backend_name.lower() == 'vllm':
-            print("Please install VLLM using: pip install vllm")
+            logger.error("Please install VLLM using: pip install vllm")
         elif backend_name.lower() == 'sglang':
-            print("Please install SGLang using: pip install sglang[srt]")
+            logger.error("Please install SGLang using: pip install sglang[srt]")
         else:
-            print(f"Please install {backend_name}")
+            logger.error(f"Please install {backend_name}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print(f"\n{backend_name} server terminated by user.")
+        logger.warning(f"\n{backend_name} server terminated by user.")
         sys.exit(0)
